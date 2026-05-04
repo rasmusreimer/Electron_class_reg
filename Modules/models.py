@@ -55,6 +55,25 @@ class FourLayerNN(nn.Module):
 
 
 
+# 3layer nn for regression (no sigmoid — outputs unbounded reals; dropout is
+# tunable so Optuna can pick a regularisation strength).
+class ThreeLayerRegressor(nn.Module):
+    def __init__(self, input_size, first_layer_size, second_layer_size,
+                 third_layer_size, dropout=0.0):
+        super(ThreeLayerRegressor, self).__init__()
+        self.fc1 = nn.Linear(input_size, first_layer_size)
+        self.fc2 = nn.Linear(first_layer_size, second_layer_size)
+        self.fc3 = nn.Linear(second_layer_size, third_layer_size)
+        self.fc4 = nn.Linear(third_layer_size, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.dropout(F.relu(self.fc1(x)))
+        x = self.dropout(F.relu(self.fc2(x)))
+        x = self.dropout(F.relu(self.fc3(x)))
+        return self.fc4(x).squeeze(-1)
+
+
 # XGBoost classifier
 from xgboost import XGBClassifier
 class XGBoostModel:
