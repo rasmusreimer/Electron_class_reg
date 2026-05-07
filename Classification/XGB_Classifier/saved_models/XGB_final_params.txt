@@ -1,0 +1,7 @@
+n_estimators: 10000
+max_depth: 4
+learning_rate: 0.1
+subsample: 0.8
+reg_lambda: 1
+eval_metric: logloss
+early_stopping_rounds: 10
