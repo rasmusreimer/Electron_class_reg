@@ -17,32 +17,45 @@ Strategy
     optimisation target with the RelMAD grader more cleanly than fitting
     raw GeV with squared error would.
 4.  `eval_metric='mape'` makes early-stopping track the grader directly.
+5.  Hyperparameter tuning uses RandomizedSearchCV with 5-fold CV, scored on
+    RelMAD. The log target is handled inside the search via
+    TransformedTargetRegressor so the scorer sees original-scale GeV.
 
 Outputs
 -------
-*  PLOT_DIR / "{model_tag}_*.png"  — diagnostic plots, one set per model.
-*  Input_lists / XGB_REG_INPUT.txt — top-20 feature list for downstream reuse.
+*  PLOT_DIR / "{model_tag}_*.png"   — diagnostic plots, one set per model.
+*  Input_lists / XGB_REG_INPUT.txt  — top-20 feature list for downstream reuse.
+*  saved_models / {tag}.joblib      — final tuned model.
+*  saved_models / {tag}_params.json — best hyperparameters from random search.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
+import joblib
 import matplotlib.pyplot as plt
 import numpy as np
-import optuna
 import pandas as pd
+from scipy.stats import loguniform, randint, uniform
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.metrics import (
+    make_scorer,
     mean_absolute_percentage_error,
     mean_squared_error,
     r2_score,
 )
+from sklearn.model_selection import KFold, RandomizedSearchCV
+from sklearn.preprocessing import FunctionTransformer
 from xgboost import XGBRegressor
+
 
 # Anchor paths to this file (not CWD) so the script works no matter where
 # Python is invoked from.
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parent
+HERE = Path(__file__).resolve().parent          # .../Regression/XGB_Regression
+REGRESSION_ROOT = HERE.parent                   # .../Regression
+PROJECT_ROOT = REGRESSION_ROOT.parent           # .../Electron_Project
 sys.path.append(str(PROJECT_ROOT))
 
 from Modules.Utils import XGB_REG_DATALOADER  # filters to true electrons
@@ -51,7 +64,8 @@ from Modules.Utils import XGB_REG_DATALOADER  # filters to true electrons
 # ---------------------------------------------------------------- configuration
 DATA_PATH = PROJECT_ROOT / 'Data' / 'AppML_InitialProject_train.h5'
 PLOT_DIR = HERE / 'XGB_Reg_plots'
-FEATURE_LIST_OUT = PROJECT_ROOT / 'Input_lists' / 'XGB_REG_INPUT.txt'
+SAVED_MODELS_DIR = HERE / 'saved_models'
+FEATURE_LIST_OUT = REGRESSION_ROOT / 'Input_lists' / 'XGB_REG_INPUT.txt'
 
 # NB: the existing codebase capitalises "Truth" (see Modules/Utils.py); the
 # project handout writes it lowercase. Adjust this constant if the on-disk
@@ -60,10 +74,11 @@ TARGET_COL = 'p_Truth_Energy'
 TOP_N_FEATURES = 20
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
-N_TRIALS = 40                       # Optuna budget for the top-20 tuning pass
+N_FOLDS = 5                         # k-fold CV used inside RandomizedSearchCV
+N_ITER = 40                         # candidate configs sampled by random search
 
 # Bits of the param dict that never change across passes (objective, metric,
-# early stopping, etc.) — kept separate so the Optuna study only sweeps over
+# early stopping, etc.) — kept separate so the random search only sweeps over
 # the things worth sweeping.
 FIXED_PARAMS = {
     'n_estimators': 10_000,         # capped in practice by early stopping
@@ -106,57 +121,78 @@ def train(X_train, X_val, y_train, y_val, params=PARAMS) -> XGBRegressor:
     return model
 
 
-def tune_hyperparameters(X_train, X_val, y_train, y_val,
-                         n_trials: int = N_TRIALS) -> dict:
+def tune_hyperparameters(X_train, y_train,
+                         n_iter: int = N_ITER,
+                         n_folds: int = N_FOLDS) -> dict:
     """
-    Run an Optuna study minimising RelMAD on the validation set.
+    RandomizedSearchCV with k-fold CV, scored on RelMAD.
 
-    Returns a full param dict (FIXED_PARAMS merged with the best tunable values),
-    ready to feed straight into `train()`.
+    The log target is handled by TransformedTargetRegressor so the scorer
+    sees original-scale GeV — the search optimises the same metric the
+    project is graded on. We don't use early stopping during the search
+    (it's awkward across CV folds without a held-out eval set), so
+    `n_estimators` is included in the search space instead.
 
-    Note on the val split: we reuse the same val set the earlier passes used
-    for early stopping. The tuned model's reported val metrics are therefore
-    a slightly optimistic estimate — the true held-out score is whatever the
-    grader's test set produces. For our purposes (picking the best config
-    among comparable ones) the bias is consistent across trials and harmless.
+    Returns a full param dict ready to feed into `train()` — FIXED_PARAMS
+    merged with the best tunable values.
     """
-    log_y_train = np.log(y_train)
-    log_y_val = np.log(y_val)
+    # n_estimators is searched, so drop the fixed cap during tuning. We
+    # also drop early_stopping_rounds — it's added back for the final
+    # refit so the diagnostic plots get a `best_iteration`.
+    search_fixed = {k: v for k, v in FIXED_PARAMS.items()
+                    if k not in ('n_estimators', 'early_stopping_rounds')}
 
-    def objective(trial: optuna.Trial) -> float:
-        tunable = {
-            'max_depth':        trial.suggest_int('max_depth', 3, 10),
-            'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-            'subsample':        trial.suggest_float('subsample', 0.5, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-            'reg_lambda':       trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
-            'reg_alpha':        trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-            'gamma':            trial.suggest_float('gamma', 1e-4, 1.0, log=True),
-        }
-        model = XGBRegressor(**FIXED_PARAMS, **tunable)
-        model.fit(
-            X_train, log_y_train,
-            eval_set=[(X_val, log_y_val)],
-            verbose=False,
-        )
-        y_pred = np.exp(model.predict(X_val))
-        return relmad(y_val, y_pred)
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(
-        direction='minimize',
-        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
+    base = XGBRegressor(**search_fixed)
+    # check_inverse=False silences sklearn's noisy round-trip check —
+    # exp(log(x)) is exact in theory but drifts in float64.
+    log_transformer = FunctionTransformer(
+        func=np.log, inverse_func=np.exp, check_inverse=False,
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    wrapped = TransformedTargetRegressor(
+        regressor=base, transformer=log_transformer,
+    )
 
-    print(f"\nOptuna best trial #{study.best_trial.number}: "
-          f"RelMAD = {study.best_value:.5f}")
+    # `uniform(loc, scale)` samples in [loc, loc+scale]; loguniform is on the
+    # log scale. Ranges mirror the previous Optuna study.
+    param_distributions = {
+        'regressor__n_estimators':     randint(200, 2000),
+        'regressor__max_depth':        randint(3, 11),
+        'regressor__learning_rate':    loguniform(0.01, 0.3),
+        'regressor__subsample':        uniform(0.5, 0.5),
+        'regressor__colsample_bytree': uniform(0.5, 0.5),
+        'regressor__reg_lambda':       loguniform(1e-3, 10.0),
+        'regressor__reg_alpha':        loguniform(1e-3, 10.0),
+        'regressor__min_child_weight': randint(1, 11),
+        'regressor__gamma':            loguniform(1e-4, 1.0),
+    }
+
+    relmad_scorer = make_scorer(relmad, greater_is_better=False)
+    kfold = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+
+    search = RandomizedSearchCV(
+        estimator=wrapped,
+        param_distributions=param_distributions,
+        n_iter=n_iter,
+        cv=kfold,
+        scoring=relmad_scorer,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        verbose=1,
+        refit=False,                  # we refit ourselves with eval_set for diagnostics
+    )
+    search.fit(X_train, y_train)
+
+    # Strip the sklearn-pipeline 'regressor__' prefix so consumers see clean names.
+    best = {k.replace('regressor__', ''): v for k, v in search.best_params_.items()}
+
+    print(f"\nRandomizedSearchCV best CV RelMAD: {-search.best_score_:.5f}  "
+          f"({n_folds}-fold CV, {n_iter} candidates)")
     print("Best params:")
-    for k, v in study.best_params.items():
+    for k, v in best.items():
         print(f"  {k:<18} {v}")
 
-    return {**FIXED_PARAMS, **study.best_params}
+    # early_stopping_rounds restored so the final refit gets best_iteration.
+    return {**FIXED_PARAMS, **best}
 
 
 def predict_geV(model: XGBRegressor, X) -> np.ndarray:
@@ -264,6 +300,38 @@ def save_feature_list(features: list[str], path: Path) -> None:
     print(f"Wrote feature list ({len(features)} features) → {path}")
 
 
+def _to_jsonable(value):
+    """Coerce numpy scalars (returned by scipy.stats samplers) to plain types."""
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def save_model_artifacts(
+    tag: str, model: XGBRegressor, params: dict, features: list[str],
+) -> None:
+    """Pickle the trained model and dump the hyperparameters as JSON."""
+    SAVED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    model_path = SAVED_MODELS_DIR / f'{tag}.joblib'
+    joblib.dump(model, model_path)
+
+    params_path = SAVED_MODELS_DIR / f'{tag}_params.json'
+    payload = {
+        'best_iteration': int(getattr(model, 'best_iteration', -1)),
+        'features': list(features),
+        'params': {k: _to_jsonable(v) for k, v in params.items()},
+    }
+    params_path.write_text(json.dumps(payload, indent=2))
+
+    print(f"Saved model        → {model_path}")
+    print(f"Saved hyperparams  → {params_path}")
+
+
 def save_all_diagnostics(
     tag: str, model: XGBRegressor, y_val, y_pred_val,
     feature_names, top_n: int,
@@ -307,10 +375,11 @@ def main() -> None:
         feature_names=top_features, top_n=TOP_N_FEATURES,
     )
 
-    # ----- Pass 3: Optuna-tuned top-N — the model used for grading ----------
+    # ----- Pass 3: random-search-tuned top-N — the model used for grading ---
     tag_tuned = f'top{TOP_N_FEATURES}_tuned'
-    print(f"\nTuning hyperparameters with {N_TRIALS} Optuna trials...")
-    tuned_params = tune_hyperparameters(X_train_top, X_val_top, y_train, y_val)
+    print(f"\nTuning hyperparameters with RandomizedSearchCV "
+          f"({N_ITER} candidates × {N_FOLDS}-fold CV)...")
+    tuned_params = tune_hyperparameters(X_train_top, y_train)
 
     model_tuned = train(X_train_top, X_val_top, y_train, y_val, params=tuned_params)
     _, y_pred_tuned = evaluate(
@@ -320,8 +389,10 @@ def main() -> None:
         tag_tuned, model_tuned, y_val, y_pred_tuned,
         feature_names=top_features, top_n=TOP_N_FEATURES,
     )
+    save_model_artifacts(tag_tuned, model_tuned, tuned_params, top_features)
 
     print(f"\nAll plots saved to {PLOT_DIR}")
+    print(f"Final model + params saved to {SAVED_MODELS_DIR}")
 
 
 if __name__ == '__main__':
