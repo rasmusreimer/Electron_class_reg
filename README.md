@@ -26,7 +26,7 @@ The regression task is restricted to true electrons only (`p_Truth_isElectron ==
 
 ## Task 1 — Classification (electron vs. non-electron)
 
-Four models. Three of them form a **2 × 2 ablation grid**: `{NN, XGBoost} × {Mutual-Information features, XGB-Feature-Importance features}`, same 15-feature budget so the comparison isolates the feature-selection choice. A CatBoost classifier with recursive SHAP feature elimination is added on top.
+Five models. Four of them form a **2 × 2 ablation**: `{NN, XGBoost} × {Mutual-Information features, XGB-Feature-Importance features}`, same 15-feature budget so the comparison isolates the feature-selection choice. A CatBoost classifier with recursive SHAP feature elimination is added on top.
 
 **Mutual-Information selector** (`Modules/Utils.py:fast_preprocess_data`)
 Drop pairs with |corr| > 0.95 (keep the higher-MI side), then take the top 15 by `mutual_info_classif`. Standard-scaled for the NN.
@@ -51,11 +51,11 @@ Architectures:
 |---|---|---|---|---|---|---|
 | NN — MI (Optuna-tuned) | 15 (MI) | 0.938 | 0.957 | 0.738 | 0.833 | ~0.96 |
 | NN — FI (Optuna-tuned) | 15 (FI) | 0.962 | 0.928 | 0.886 | 0.907 | ~0.99 |
-| XGB — MI (Optuna-tuned) | 15 (MI) | 0.944 | 0.95 | 0.77 | 0.85 | — |
+| XGB — MI (Optuna-tuned) | 15 (MI) | 0.944 | 0.95 | 0.77 | 0.85 | 0.968 |
 | **XGB — FI (full → top-15)** | **15 (FI)** | **0.974** | **0.95** | **0.92** | **0.94** | ~0.995 |
-| **CatBoost (recursive SHAP)** | — | — | — | — | — | **0.9938** |
+| **CatBoost (recursive SHAP)** | — | 0.965 | 0.891 | 0.952 | 0.920 | **0.9938** |
 
-Submitted classification models: **NN-MI, NN-FI, XGB-FI, CatBoost** (CSVs under `Submission/`).
+Submitted classification models: **NN-MI, NN-FI, XGB-FI, CatBoost**.
 
 **Headline.** The feature subset selected by the boosted tree itself is more informative than the MI-ranked subset for *both* model families. The NN gains ~7 pp F1 just by switching feature lists at fixed architecture; the XGB gains ~9 pp. CatBoost with its own recursive-SHAP selection lands in the same AUC ballpark as the FI-track XGB, very slightly above on AUC alone.
 
@@ -108,7 +108,7 @@ Ensemble weights (Dirichlet search on val): XGB 0.385 / LGB 0.372 / CatBoost 0.2
 | C7  | 0.358 |  64.67% | `y = log(p_pt_track · (1 + eta²))` |
 | C10 | 0.291 |  54.89% | `y = log(0.686·pX_ecore / (p_ptcone40 + 1.25) + p_pt_track)` |
 
-C10 is the best closed-form expression and still ~2.8× worse than the ensemble. Useful as a floor for "what could a physicist guess unaided" rather than a competitive model.
+C10 is the best closed-form expression and still ~2.8× worse than the ensemble. Interesting but not quite a competitive model.
 
 ---
 
@@ -160,7 +160,6 @@ C10 is the best closed-form expression and still ~2.8× worse than the ensemble.
 │   │               # XGB_REG_DATALOADER (regression, e-only)
 │   └── models.py    # NN classifiers + ThreeLayerRegressor + XGBoostModel wrapper
 │
-├── Submission/      # final CSVs + description (gitignored)
 └── Data/            # train + blind classification + blind regression (HDF5)
 ```
 
