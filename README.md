@@ -172,7 +172,5 @@ Path invariance - currently uses absolute paths for dataloading in config files 
 Dataloader utils, currently multple functions that should be merged into one with configs triggering the different variances, instead of having whole different functions.
 Eg standardize as config option, sort by mi, remove correlation etc.
 
-Unify the standalone regression scripts. XGB_Reg.py, catboost_reg.py, and LGB_REG. Highly similar so. They should be a single config driven entry point.
-
 Streamline and organize models (input lists, parameters and so forth currently new ones save directly to submission format, old ones to /input or /saved_models)
 Write callable scripts of the old models, which only exists in notebooks for now.
